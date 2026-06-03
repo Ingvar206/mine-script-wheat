@@ -386,6 +386,36 @@ def _clear_pests_in_area(rounds: int = 10) -> None:
         time.sleep(0.5)
 
 
+def _wait_stable_at_pos(sx: float, sz: float, duration: float = 5.0, tolerance: float = 2.0) -> bool:
+    """Wartet, bis der Spieler `duration` Sekunden ununterbrochen an der Startposition bleibt.
+    Gibt False zurück wenn RUN_FILE verschwindet oder der Timeout (60s) erreicht wird."""
+    echo(f"Positions-Check: {duration:.0f}s an Startposition bleiben (X={sx:.0f} Z={sz:.0f})")
+    stable_since = None
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
+        if not RUN_FILE.exists():
+            return False
+        try:
+            p = player()
+            px, pz = float(p.position[0]), float(p.position[2])
+            dist = math.sqrt((sx - px) ** 2 + (sz - pz) ** 2)
+            if dist <= tolerance:
+                if stable_since is None:
+                    stable_since = time.time()
+                if time.time() - stable_since >= duration:
+                    echo("Positions-Check bestanden – Farming wird fortgesetzt")
+                    return True
+            else:
+                if stable_since is not None:
+                    echo(f"Position verlassen (dist={dist:.1f}) – Timer zurueckgesetzt")
+                stable_since = None
+        except Exception:
+            pass
+        time.sleep(0.1)
+    echo("Positions-Check Timeout – Farming wird trotzdem fortgesetzt")
+    return False
+
+
 def _handle_pests(saved_pos: tuple, strafing_left: bool) -> None:
     echo("Schaedlinge erkannt – Farming pausiert")
     _stop_all_keys()
@@ -450,6 +480,12 @@ def _handle_pests(saved_pos: tuple, strafing_left: bool) -> None:
     # Ausrichtung wiederherstellen
     player_set_orientation(90, 0)
     time.sleep(0.2)
+
+    # Sicherstellen dass der Spieler 5 Sekunden an der Startposition bleibt
+    _wait_stable_at_pos(sx, sz, tolerance=0.5)
+
+    if not RUN_FILE.exists():
+        return
 
     echo("Position wiederhergestellt – Farming wird fortgesetzt")
     player_press_forward(True)
@@ -636,7 +672,7 @@ def start_loop() -> None:
     if _restart:
         echo("Neustart...")
         time.sleep(2.0)
-        chat("\\wheat start")
+        start_loop()
 
 
 def stop_loop() -> None:
