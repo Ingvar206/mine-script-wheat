@@ -2,6 +2,10 @@ import sys
 import time
 import math
 import random
+import re
+import json
+import os
+import subprocess
 from pathlib import Path
 
 from minescript import (
@@ -17,6 +21,7 @@ from minescript import (
     player_press_left,
     player_press_right,
     player_look_at,
+    player_set_orientation,
     entities,
 )
 
@@ -35,9 +40,50 @@ if _set_hotbar_slot is None:
     def _set_hotbar_slot(n): pass
 
 
-DEBUG_ENTITIES = True  # Auf False setzen wenn Diagnose abgeschlossen
+DEBUG_ENTITIES = False
+DEBUG_LOG = True  # Alle neuen Log-Zeilen anzeigen um Pest-Nachrichten-Format zu finden
 
-RUN_FILE = Path(__file__).with_suffix(".running")
+RUN_FILE      = Path(__file__).with_suffix(".running")
+STATE_FILE    = Path(__file__).with_suffix(".json")
+WATCHDOG_FILE = Path(__file__).with_name("wheat_watchdog.py")
+PID_FILE      = Path(__file__).with_name("wheat_watchdog.pid")
+
+# Minecraft latest.log – Server-Nachrichten werden hier geschrieben (plotübergreifend)
+_PROFILE_DIR = Path(__file__).parent.parent  # .../profiles/New instance (1)
+LOG_FILE = _PROFILE_DIR / "logs" / "latest.log"
+
+# Hypixels Pest-Spawn-Nachricht enthält immer das ൠ-Symbol – präziser als Keywords
+PEST_SPAWN_SYMBOL = 'ൠ'
+
+# Eigene Echo-Nachrichten die im Log ignoriert werden sollen
+_OWN_ECHO_PREFIXES = ("[Pest]", "[LOG]", "[DBG]", "=== wheat", "hotbar:",
+                      "Schaedling", "Warp ", "Alle Schae", "Setze Farm",
+                      "Pest-Counter", "Stop wheat", "Kein Weizen")
+
+
+def _load_pest_count() -> int:
+    try:
+        return int(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("pest_count", 0))
+    except Exception:
+        return 0
+
+
+def _save_pest_count(n: int) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps({"pest_count": n}), encoding="utf-8")
+    except Exception as _e:
+        echo(f"[State] Speichern fehlgeschlagen: {_e}")
+
+
+def _parse_pest_increment(chat_line: str) -> int:
+    """Extrahiert Pest-Anzahl aus der Nachricht anhand des ൠ-Symbols.
+    '§22 §2ൠ Pest' → strip Farbcodes → '2 ൠ Pest' → 2."""
+    clean = re.sub(r'§.', '', chat_line)
+    idx = clean.find(PEST_SPAWN_SYMBOL)
+    if idx > 0:
+        m = re.search(r'\b([2-9])\b', clean[:idx])
+        return int(m.group(1)) if m else 1
+    return 1
 STRAFE_STABLE_MIN = 1
 STRAFE_STABLE_MAX = 1.1
 
@@ -88,7 +134,7 @@ def _toggle_flight() -> None:
     time.sleep(0.15)
 
 
-def _fly_to(tx: float, ty: float, tz: float) -> None:
+def _fly_to(tx: float, ty: float, tz: float, stop_dist: float = NAV_CLOSE_ENOUGH) -> None:
     """Fliege zu einer festen Position auf sicherer Höhe."""
     player_press_forward(True)
     deadline = time.time() + NAV_TIMEOUT
@@ -102,7 +148,7 @@ def _fly_to(tx: float, ty: float, tz: float) -> None:
             px = float(p.position[0])
             pz = float(p.position[2])
             xz_dist = math.sqrt((tx - px) ** 2 + (tz - pz) ** 2)
-            if xz_dist < NAV_CLOSE_ENOUGH:
+            if xz_dist < stop_dist:
                 break
             player_look_at(tx, ty, tz)
         except Exception:
@@ -111,6 +157,45 @@ def _fly_to(tx: float, ty: float, tz: float) -> None:
     player_press_forward(False)
     player_press_backward(True)
     time.sleep(0.25)
+    player_press_backward(False)
+
+
+def _wait_land(timeout: float = 4.0) -> None:
+    """Wartet bis der Spieler gelandet ist (Y stabilisiert sich)."""
+    deadline = time.time() + timeout
+    last_y = None
+    while time.time() < deadline:
+        try:
+            cy = float(player().position[1])
+            if last_y is not None and abs(cy - last_y) < 0.05:
+                break
+            last_y = cy
+        except Exception:
+            pass
+        time.sleep(0.1)
+    time.sleep(0.2)
+
+
+def _walk_to(tx: float, ty: float, tolerance: float = 0.05) -> None:
+    """Läuft zu Fuß zur Zielposition. Nur X muss auf 0.05 genau stimmen, Z wird ignoriert."""
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if not RUN_FILE.exists():
+            break
+        try:
+            p = player()
+            px, pz = float(p.position[0]), float(p.position[2])
+            if abs(tx - px) < tolerance:
+                break
+            # Z der aktuellen Position halten – nur X korrigieren
+            player_look_at(tx, ty, pz)
+            player_press_forward(True)
+        except Exception:
+            pass
+        time.sleep(0.05)
+    player_press_forward(False)
+    player_press_backward(True)
+    time.sleep(0.15)
     player_press_backward(False)
 
 
@@ -333,7 +418,7 @@ def _handle_pests(saved_pos: tuple, strafing_left: bool) -> None:
     if not RUN_FILE.exists():
         return
 
-    echo("Alle Schaedlinge besiegt – /warp garden")
+    echo("Alle Schaedlinge besiegt – kehre zur Ausgangsposition zurueck")
 
     try:
         _set_hotbar_slot(0)
@@ -341,14 +426,32 @@ def _handle_pests(saved_pos: tuple, strafing_left: bool) -> None:
         echo(f"Hotbar Fehler: {err}")
 
     _stop_all_keys()
-    _toggle_flight()
-    chat("/warp garden")
-    time.sleep(2.5)
+
+    # 5 Blöcke vor der Startposition stoppen, dann zu Fuß weitergehen
+    sx, sy, sz = saved_pos
+    _fly_to(sx, NAV_SAFE_Y, sz, stop_dist=5.0)
 
     if not RUN_FILE.exists():
         return
 
-    echo("Setze Farming fort")
+    # Flug aus, landen
+    _toggle_flight()
+    _wait_land()
+
+    if not RUN_FILE.exists():
+        return
+
+    # Zu Fuß zur exakten Startposition (inkl. Y für player_look_at)
+    _walk_to(sx, sy)
+
+    if not RUN_FILE.exists():
+        return
+
+    # Ausrichtung wiederherstellen
+    player_set_orientation(90, 0)
+    time.sleep(0.2)
+
+    echo("Position wiederhergestellt – Farming wird fortgesetzt")
     player_press_forward(True)
     if strafing_left:
         player_press_left(True)
@@ -357,11 +460,28 @@ def _handle_pests(saved_pos: tuple, strafing_left: bool) -> None:
     player_press_attack(True)
 
 
-PEST_TRIGGER_COUNT = 5   # unique pests needed to trigger handling
+PEST_TRIGGER_COUNT = 6   # unique pests needed to trigger handling
+
+
+def _ensure_watchdog() -> None:
+    if PID_FILE.exists():
+        try:
+            os.kill(int(PID_FILE.read_text()), 0)
+            echo("[Watchdog] Läuft bereits")
+            return
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+    subprocess.Popen(
+        [sys.executable, str(WATCHDOG_FILE)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    echo("[Watchdog] Gestartet")
 
 
 def start_loop() -> None:
     RUN_FILE.write_text("running", encoding="utf-8")
+    _ensure_watchdog()
     echo("=== wheat v3 start ===")
     if _HOTBAR_FUNC_NAME:
         echo(f"hotbar: {_HOTBAR_FUNC_NAME}")
@@ -382,9 +502,12 @@ def start_loop() -> None:
     HARVEST_TIMEOUT = 30.0
     last_harvest_time = time.time()
 
-    last_pest_check = 0.0
-    seen_pest_ids: set = set()
+    # Log-basierter Pest-Counter (plotübergreifend, renderdistanz-unabhängig)
+    pest_chat_count = _load_pest_count()
+    echo(f"[Pest] Gespeicherter Counter: {pest_chat_count}/{PEST_TRIGGER_COUNT}")
+    log_pos = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
 
+    _restart = False
     try:
         while RUN_FILE.exists():
             now = time.time()
@@ -407,8 +530,6 @@ def start_loop() -> None:
                     player_press_right(False)
                     chat("/warp garden")
                     time.sleep(2.0)
-                    seen_pest_ids.clear()
-                    last_pest_check = time.time() + 5.0
                     echo("Warp ausgefuehrt")
                     player_press_forward(True)
                     if strafing_left:
@@ -426,45 +547,58 @@ def start_loop() -> None:
                 pass
 
             if now - last_harvest_time >= HARVEST_TIMEOUT:
-                echo("Kein Weizen seit 30s – Warp wird ausgefuehrt")
+                echo("Kein Weizen seit 30s – Warp und Neustart")
                 player_press_attack(False)
                 player_press_forward(False)
                 player_press_left(False)
                 player_press_right(False)
+                chat("/lobby")
+                time.sleep(3.0)
                 chat("/skyblock")
                 time.sleep(3.0)
                 chat("/warp garden")
-                time.sleep(2.0)
-                seen_pest_ids.clear()
-                last_pest_check = time.time() + 5.0
-                last_harvest_time = time.time()
-                player_press_forward(True)
-                if strafing_left:
-                    player_press_left(True)
-                else:
-                    player_press_right(True)
-                player_press_attack(True)
+                time.sleep(6.0)
+                _restart = True
+                break
 
-            # ---- Pest-Zähler: neue unique Schädlinge tracken ----
-            if x is not None and now - last_pest_check >= PEST_CHECK_INTERVAL:
-                last_pest_check = now
-                for pest in _get_pests():
-                    pid = getattr(pest, 'id', None) or None
-                    if not pid:
-                        coords = _epos(pest)
-                        if coords is None:
+            # ---- Pest-Counter via latest.log (plotübergreifend, renderdistanz-unabhängig) ----
+            if LOG_FILE.exists():
+                try:
+                    with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as _lf:
+                        _lf.seek(log_pos)
+                        _new = _lf.read()
+                        log_pos = _lf.tell()
+                    for _line in _new.splitlines():
+                        if "[CHAT]" not in _line:
                             continue
-                        pid = (round(coords[0]), round(coords[1]), round(coords[2]))
-                    if pid not in seen_pest_ids:
-                        seen_pest_ids.add(pid)
-                        echo(f"[Pest] #{len(seen_pest_ids)} erkannt (id={pid})")
-                if len(seen_pest_ids) >= PEST_TRIGGER_COUNT:
-                    echo(f"Pest-Limit {PEST_TRIGGER_COUNT} erreicht – starte Bekaempfung")
-                    seen_pest_ids.clear()
+                        _chat = _line.split("[CHAT]", 1)[1].strip()
+                        if _chat.startswith(_OWN_ECHO_PREFIXES):
+                            continue
+                        _clean = re.sub(r'§.', '', _chat)
+                        if DEBUG_LOG:
+                            echo(f"[LOG] {_clean}")
+                        if PEST_SPAWN_SYMBOL in _clean:
+                            increment = _parse_pest_increment(_chat)
+                            pest_chat_count += increment
+                            _save_pest_count(pest_chat_count)
+                            echo(f"[Pest] +{increment} → {pest_chat_count}/{PEST_TRIGGER_COUNT}: {_clean}")
+                except Exception as _e:
+                    echo(f"[LOG] Fehler: {_e}")
+
+            if pest_chat_count >= PEST_TRIGGER_COUNT:
+                in_farm = (x is not None
+                           and FARM_X_MIN - 30 <= x <= FARM_X_MAX + 30
+                           and FARM_Z_MIN - 30 <= z <= FARM_Z_MAX + 30)
+                if in_farm:
+                    echo(f"Pest-Counter {pest_chat_count} >= {PEST_TRIGGER_COUNT} – starte Bekaempfung")
+                    pest_chat_count = 0
+                    _save_pest_count(0)
                     _handle_pests((x, y, z), strafing_left)
-                    seen_pest_ids.clear()
-                    last_pest_check = time.time() + 15.0
+                    # NACH dem Hunt: alle während der Jagd geschriebenen Log-Zeilen überspringen
+                    log_pos = LOG_FILE.stat().st_size if LOG_FILE.exists() else log_pos
                     last_harvest_time = time.time()
+                else:
+                    echo(f"[Pest] Counter {pest_chat_count} – nicht im Farm-Bereich, warte auf Rueckkehr")
 
             # ---- Strafing-Wechsel ----
             if z is not None and x is not None:
@@ -489,6 +623,7 @@ def start_loop() -> None:
             time.sleep(0.01)
 
     finally:
+        _save_pest_count(pest_chat_count)
         player_press_attack(False)
         player_press_forward(False)
         player_press_backward(False)
@@ -497,6 +632,11 @@ def start_loop() -> None:
         player_press_use(False)
         if RUN_FILE.exists():
             RUN_FILE.unlink()
+
+    if _restart:
+        echo("Neustart...")
+        time.sleep(2.0)
+        chat("\\wheat start")
 
 
 def stop_loop() -> None:
